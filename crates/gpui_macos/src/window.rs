@@ -660,6 +660,17 @@ impl MacWindow {
                 if titlebar.appears_transparent {
                     style_mask |= NSWindowStyleMask::NSFullSizeContentViewWindowMask;
                 }
+            } else if matches!(kind, WindowKind::PopUp) {
+                // PopUp windows with no titlebar are treated as truly
+                // borderless: AppKit does not impose its ~10 px window-
+                // corner radius, the window has no shadow chrome, and
+                // the entire content area is paintable. This is what
+                // context menus, tooltips, and other transient
+                // overlays need — the rounded "titled" window
+                // otherwise clips arbitrary popup content into a
+                // visibly rounded card. Other window kinds keep the
+                // historical full-size content view treatment.
+                style_mask = NSWindowStyleMask::NSBorderlessWindowMask;
             } else {
                 style_mask = NSWindowStyleMask::NSTitledWindowMask
                     | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
