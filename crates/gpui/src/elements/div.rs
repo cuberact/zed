@@ -2597,18 +2597,44 @@ impl Interactivity {
             });
             let current_view = window.current_view();
 
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let hovered = hitbox.is_hovered(window);
-                let was_hovered = hover_state
-                    .as_ref()
-                    .is_some_and(|state| state.borrow().element);
-                if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    if let Some(hover_state) = &hover_state {
-                        hover_state.borrow_mut().element = hovered;
-                        cx.notify(current_view);
+            // Same closure body needs to fire on both MouseMove and
+            // MouseExited. on_mouse_event dispatch is type-keyed, so a
+            // single registration covers only one event type — without the
+            // exit-side listener, the hover cache stays `true` after the
+            // cursor leaves the window and the hover style persists to the
+            // next frame triggered by something else.
+            let update_element_hover = {
+                let hitbox = hitbox.clone();
+                let hover_state = hover_state.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    let hovered = hitbox.is_hovered(window);
+                    let was_hovered = hover_state
+                        .as_ref()
+                        .is_some_and(|state| state.borrow().element);
+                    if hovered != was_hovered {
+                        if let Some(hover_state) = &hover_state {
+                            hover_state.borrow_mut().element = hovered;
+                            cx.notify(current_view);
+                        }
                     }
                 }
-            });
+            };
+            {
+                let mut update = update_element_hover.clone();
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        update(window, cx);
+                    }
+                });
+            }
+            {
+                let mut update = update_element_hover;
+                window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        update(window, cx);
+                    }
+                });
+            }
         }
 
         if let Some(group_hover) = self.group_hover_style.as_ref() {
@@ -2619,18 +2645,34 @@ impl Interactivity {
                     .cloned();
                 let current_view = window.current_view();
 
-                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                let update_group_hover = move |window: &mut Window, cx: &mut App| {
                     let group_hovered = group_hitbox_id.is_hovered(window);
                     let was_group_hovered = hover_state
                         .as_ref()
                         .is_some_and(|state| state.borrow().group);
-                    if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
+                    if group_hovered != was_group_hovered {
                         if let Some(hover_state) = &hover_state {
                             hover_state.borrow_mut().group = group_hovered;
                         }
                         cx.notify(current_view);
                     }
-                });
+                };
+                {
+                    let mut update = update_group_hover.clone();
+                    window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture {
+                            update(window, cx);
+                        }
+                    });
+                }
+                {
+                    let mut update = update_group_hover;
+                    window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture {
+                            update(window, cx);
+                        }
+                    });
+                }
             }
         }
 
