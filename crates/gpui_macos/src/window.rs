@@ -692,6 +692,11 @@ impl MacWindow {
             }
 
             let mut style_mask;
+            // Tracks the titleless `WindowKind::PopUp` case so the
+            // post-creation block below can apply borderless-only
+            // configuration (drop shadow restoration, hide-on-deactivate)
+            // that the titled PopUp variant doesn't need.
+            let mut borderless_popup = false;
             if let Some(titlebar) = titlebar.as_ref() {
                 style_mask =
                     NSWindowStyleMask::NSClosableWindowMask | NSWindowStyleMask::NSTitledWindowMask;
@@ -718,6 +723,7 @@ impl MacWindow {
                 // visibly rounded card. Other window kinds keep the
                 // historical full-size content view treatment.
                 style_mask = NSWindowStyleMask::NSBorderlessWindowMask;
+                borderless_popup = true;
             } else {
                 style_mask = NSWindowStyleMask::NSTitledWindowMask
                     | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
@@ -728,6 +734,13 @@ impl MacWindow {
                     msg_send![WINDOW_CLASS, alloc]
                 }
                 WindowKind::PopUp => {
+                    // Both titled and borderless PopUp use NSPanel's
+                    // nonactivating behaviour: AppKit keeps the parent as
+                    // the key window so its titlebar stays lit. The popup
+                    // still receives mouse events normally because its view
+                    // returns YES from `acceptsFirstMouse:`, so the classic
+                    // two-click gesture for non-key windows is bypassed and
+                    // the first click in the popup runs immediately.
                     style_mask |= NSWindowStyleMaskNonactivatingPanel;
                     msg_send![PANEL_CLASS, alloc]
                 }
@@ -899,6 +912,26 @@ impl MacWindow {
             let main_window: id = msg_send![app, mainWindow];
             let mut sheet_parent = None;
 
+            // Every window kind gets the same tracking area on its content
+            // view. This guarantees `mouseEntered:` / `mouseExited:` are
+            // delivered uniformly (regardless of key status) and that
+            // `mouseMoved:` flows even when the window isn't key — necessary
+            // so a non-key window can clear its own latched hover state when
+            // the cursor leaves it. `NSTrackingInVisibleRect` lets the area
+            // auto-resize with the view; the explicit rect passed below is
+            // ignored under that flag. Owner is the view, so callbacks fire
+            // through the existing `mouseEntered:` / `mouseExited:` selectors
+            // already registered on `VIEW_CLASS`.
+            let tracking_area: id = msg_send![class!(NSTrackingArea), alloc];
+            let _: () = msg_send![
+                tracking_area,
+                initWithRect: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
+                options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                owner: native_view
+                userInfo: nil
+            ];
+            let _: () = msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
+
             match kind {
                 WindowKind::Normal | WindowKind::Floating => {
                     if kind == WindowKind::Floating {
@@ -917,20 +950,9 @@ impl MacWindow {
                     }
                 }
                 WindowKind::PopUp => {
-                    // Use a tracking area to allow receiving MouseMoved events even when
-                    // the window or application aren't active, which is often the case
-                    // e.g. for notification windows.
-                    let tracking_area: id = msg_send![class!(NSTrackingArea), alloc];
-                    let _: () = msg_send![
-                        tracking_area,
-                        initWithRect: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
-                        options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
-                        owner: native_view
-                        userInfo: nil
-                    ];
-                    let _: () =
-                        msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
-
+                    // Tracking area is registered uniformly above for every
+                    // window kind; the popup-specific setup that follows just
+                    // bumps the window level and configures presentation.
                     native_window.setLevel_(NSPopUpWindowLevel);
                     let _: () = msg_send![
                         native_window,
@@ -940,6 +962,19 @@ impl MacWindow {
                         NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces |
                         NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
                     );
+
+                    if borderless_popup {
+                        // Borderless NSPanel drops the drop shadow that the
+                        // titled variant inherits from the standard window
+                        // chrome — restore it explicitly so the popup keeps
+                        // the visual lift that distinguishes it from inline
+                        // content. `setHidesOnDeactivate:YES` adds a sane
+                        // dismissal: when the user switches to another
+                        // application the popup goes away on its own,
+                        // matching how `NSMenu` behaves.
+                        let _: () = msg_send![native_window, setHasShadow: YES];
+                        let _: () = msg_send![native_window, setHidesOnDeactivate: YES];
+                    }
                 }
                 WindowKind::Dialog => {
                     if !main_window.is_null() {
