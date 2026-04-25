@@ -375,6 +375,27 @@ impl Interactivity {
             }));
     }
 
+    /// Capture-phase variant of [`Self::on_scroll_wheel`]. Fires before
+    /// any descendants see the event, so a parent element can intercept
+    /// scroll (e.g. for Cmd-modified zoom) and `cx.stop_propagation()`
+    /// to keep the descendants' own scroll listeners from also acting
+    /// on it. Bounds containment is the gate — `is_hovered` would be
+    /// gated by the window's hover-suppressed flag, which is unrelated
+    /// to scroll routing.
+    pub fn capture_scroll_wheel(
+        &mut self,
+        listener: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.scroll_wheel_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture
+                    && hitbox.bounds.contains(&window.mouse_position())
+                {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
     /// Bind the given callback to pinch gesture events during the bubble phase.
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
@@ -968,6 +989,17 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().on_scroll_wheel(listener);
+        self
+    }
+
+    /// Fluent equivalent of [`Interactivity::capture_scroll_wheel`]. Fires
+    /// during the capture phase so a parent element can intercept scroll
+    /// before any descendant scroll listener sees it.
+    fn capture_scroll_wheel(
+        mut self,
+        listener: impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_scroll_wheel(listener);
         self
     }
 
