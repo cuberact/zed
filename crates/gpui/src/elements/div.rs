@@ -155,6 +155,27 @@ impl Interactivity {
             }));
     }
 
+    /// Capture-phase variant that fires when the cursor is inside the
+    /// element's bounds, **regardless of hover suppression**. Use this
+    /// when the element should react to clicks landing on it even if
+    /// the window has been put into hover-suppressed mode by the app
+    /// (e.g. a parent window detecting click-outside dismiss for a
+    /// non-activating popup). For normal "react when hovered" semantics
+    /// prefer `capture_any_mouse_down`.
+    pub fn capture_any_mouse_down_in_bounds(
+        &mut self,
+        listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.mouse_down_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture
+                    && hitbox.bounds.contains(&window.mouse_position())
+                {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
     /// Bind the given callback to the mouse down event for any button, during the bubble phase.
     /// The imperative API equivalent to [`InteractiveElement::on_any_mouse_down`].
     ///
@@ -869,6 +890,17 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().capture_any_mouse_down(listener);
+        self
+    }
+
+    /// Fluent equivalent of [`Interactivity::capture_any_mouse_down_in_bounds`].
+    /// Fires for any mouse-down landing inside the element's bounds during the
+    /// capture phase, ignoring this window's hover-suppressed state.
+    fn capture_any_mouse_down_in_bounds(
+        mut self,
+        listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_any_mouse_down_in_bounds(listener);
         self
     }
 
