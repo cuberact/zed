@@ -598,6 +598,14 @@ impl HitboxId {
         if window.captured_hitbox == Some(self) {
             return true;
         }
+        // Honor the application-controlled hover suppression flag. The flag
+        // is set explicitly by the app (see `Window::set_hover_suppressed`)
+        // when another window — typically a non-activating popup — is the
+        // intended hover surface and this window should not paint hover at
+        // all, even though it still receives mouse-move events from the OS.
+        if window.is_hover_suppressed() {
+            return false;
+        }
         if window.last_input_was_keyboard() {
             return false;
         }
@@ -981,6 +989,16 @@ pub struct Window {
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
+    /// Application-controlled override that suppresses every hover paint on
+    /// this window. Defaults to `false` (hover behaves normally). The point
+    /// of the flag is to let an app keep one window the OS-key window while
+    /// telling other windows to behave as if they didn't own the cursor —
+    /// e.g. a custom non-activating popup wants `false` so its own items can
+    /// hover, while the main window underneath gets `true` so it doesn't
+    /// flash hover under the popup. Decoupled from `is_window_hovered()` so
+    /// an app can paint a popup without the OS having to make it key (which
+    /// on macOS would grey out the underlying window's titlebar).
+    hover_suppressed: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
@@ -1291,6 +1309,7 @@ impl Window {
         let invalidator = WindowInvalidator::new();
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
+        let hover_suppressed = Rc::new(Cell::new(false));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
@@ -1591,6 +1610,7 @@ impl Window {
             button_layout_observers: SubscriberSet::new(),
             active,
             hovered,
+            hover_suppressed,
             needs_present,
             input_rate_tracker,
             #[cfg(feature = "input-latency-histogram")]
@@ -2140,6 +2160,31 @@ impl Window {
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
+    }
+
+    /// Whether the application has asked this window to suppress its hover
+    /// paint. See `set_hover_suppressed` for the use case.
+    pub fn is_hover_suppressed(&self) -> bool {
+        self.hover_suppressed.get()
+    }
+
+    /// Toggle the application-controlled hover suppression for this window.
+    /// While suppressed, every `Hitbox::is_hovered` call on this window
+    /// returns `false`, which collapses every hover-style paint and every
+    /// hover-driven cursor change to its non-hovered branch — mouse events
+    /// still flow normally, only the *visual* hover state stops painting.
+    ///
+    /// The intended use is multi-window scenarios where the app wants one
+    /// window to behave as the "active hover surface" without making it the
+    /// OS key window: e.g. a non-activating popup keeps the parent window
+    /// key (so the parent's titlebar stays lit), but the parent should not
+    /// flash hover under the popup. The app sets `true` on the parent for
+    /// the popup's lifetime and `false` again on dismiss.
+    pub fn set_hover_suppressed(&mut self, suppressed: bool) {
+        if self.hover_suppressed.get() != suppressed {
+            self.hover_suppressed.set(suppressed);
+            self.refresh();
+        }
     }
 
     /// Returns whether this window is considered to be the window
