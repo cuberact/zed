@@ -4313,6 +4313,17 @@ impl Window {
                 PlatformInput::MousePressure(mouse_pressure)
             }
             PlatformInput::MouseExited(mouse_exited) => {
+                // Update the cached cursor position so any hover state that
+                // was latched on the last interior position releases when
+                // the cursor leaves the window. Without this, hit-test for
+                // hover still finds the last interior element and the hover
+                // style stays painted indefinitely after the cursor is gone.
+                // The per-element hover handlers in `div::paint` are
+                // registered for both `MouseMoveEvent` and `MouseExitEvent`
+                // so the diff-and-notify path that normally tracks hover
+                // transitions also fires on the exit, producing a re-render
+                // through the same mechanism that handles ordinary motion.
+                self.mouse_position = mouse_exited.position;
                 self.modifiers = mouse_exited.modifiers;
                 PlatformInput::MouseExited(mouse_exited)
             }
