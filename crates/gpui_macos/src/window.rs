@@ -990,6 +990,11 @@ impl MacWindow {
             }
 
             let mut style_mask;
+            // Tracks the titleless `WindowKind::PopUp` case so the
+            // post-creation block below can apply borderless-only
+            // configuration (drop shadow restoration, hide-on-deactivate)
+            // that the titled PopUp variant doesn't need.
+            let mut borderless_popup = false;
             if let Some(titlebar) = titlebar.as_ref() {
                 style_mask =
                     NSWindowStyleMask::NSClosableWindowMask | NSWindowStyleMask::NSTitledWindowMask;
@@ -1016,6 +1021,7 @@ impl MacWindow {
                 // visibly rounded card. Other window kinds keep the
                 // historical full-size content view treatment.
                 style_mask = NSWindowStyleMask::NSBorderlessWindowMask;
+                borderless_popup = true;
             } else {
                 style_mask = NSWindowStyleMask::NSTitledWindowMask
                     | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
@@ -1028,6 +1034,13 @@ impl MacWindow {
                 // `AnchoredPopup` is rejected in `MacPlatform::open_window`, grouped here only
                 // for exhaustiveness.
                 WindowKind::PopUp | WindowKind::AnchoredPopup(_) => {
+                    // Both titled and borderless PopUp use NSPanel's
+                    // nonactivating behaviour: AppKit keeps the parent as
+                    // the key window so its titlebar stays lit. The popup
+                    // still receives mouse events normally because its view
+                    // returns YES from `acceptsFirstMouse:`, so the classic
+                    // two-click gesture for non-key windows is bypassed and
+                    // the first click in the popup runs immediately.
                     style_mask |= NSWindowStyleMaskNonactivatingPanel;
                     msg_send![PANEL_CLASS, alloc]
                 }
@@ -1221,6 +1234,10 @@ impl MacWindow {
                         // Let the window float keep above normal windows.
                         native_window.setLevel_(NSFloatingWindowLevel);
                         native_window.setAcceptsMouseMovedEvents_(YES);
+                        // A floating window gets the tracking area too, so it
+                        // hears `mouseExited:` and can release a hover state
+                        // painted on content the cursor has left.
+                        add_mouse_tracking_area(tracking_view);
                     } else {
                         native_window.setLevel_(NSNormalWindowLevel);
                         native_window.setAcceptsMouseMovedEvents_(NO);
@@ -1248,8 +1265,23 @@ impl MacWindow {
                         NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces |
                         NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
                     );
+
+                    if borderless_popup {
+                        // Borderless NSPanel drops the drop shadow that the
+                        // titled variant inherits from the standard window
+                        // chrome — restore it explicitly so the popup keeps
+                        // the visual lift that distinguishes it from inline
+                        // content. `setHidesOnDeactivate:YES` adds a sane
+                        // dismissal: when the user switches to another
+                        // application the popup goes away on its own,
+                        // matching how `NSMenu` behaves.
+                        let _: () = msg_send![native_window, setHasShadow: YES];
+                        let _: () = msg_send![native_window, setHidesOnDeactivate: YES];
+                    }
                 }
                 WindowKind::Dialog => {
+                    // As a floating window: `mouseExited:` releases hover.
+                    add_mouse_tracking_area(tracking_view);
                     if !main_window.is_null() {
                         let parent = {
                             let active_sheet: id = msg_send![main_window, attachedSheet];
