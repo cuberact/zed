@@ -6702,6 +6702,42 @@ impl Window {
         }
     }
 
+    /// Put `buttons` into the window's native titlebar, on the side
+    /// opposite the window controls, replacing any put there before —
+    /// the titlebar itself stays the platform's, its title, its colours
+    /// and its behaviour included. `on_click` is called with the index
+    /// of the button clicked; `on_hover` with a button's index and its
+    /// bounds in this window's coordinates when the pointer enters it,
+    /// and `None` when it leaves — what an application's own tooltip is
+    /// placed by.
+    ///
+    /// Returns `false` where the platform has no native titlebar to put
+    /// buttons in (today everywhere but macOS); the application draws
+    /// them itself there.
+    pub fn set_titlebar_buttons(
+        &self,
+        buttons: Vec<crate::TitlebarButton>,
+        cx: &App,
+        on_click: impl Fn(usize, &mut Window, &mut App) + 'static,
+        on_hover: impl Fn(usize, Option<Bounds<Pixels>>, &mut Window, &mut App) + 'static,
+    ) -> bool {
+        let mut click_cx = self.to_async(cx);
+        let mut hover_cx = self.to_async(cx);
+        self.platform_window.set_titlebar_buttons(
+            buttons,
+            Box::new(move |index| {
+                click_cx
+                    .update(|window, cx| on_click(index, window, cx))
+                    .ok();
+            }),
+            Box::new(move |index, bounds| {
+                hover_cx
+                    .update(|window, cx| on_hover(index, bounds, window, cx))
+                    .ok();
+            }),
+        )
+    }
+
     /// Register a callback that can interrupt the closing of the current window based the returned boolean.
     /// If the callback returns false, the window won't be closed.
     pub fn on_window_should_close(

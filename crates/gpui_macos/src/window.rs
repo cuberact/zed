@@ -87,6 +87,7 @@ static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
+static mut TITLEBAR_BUTTON_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
 static mut WINDOW_STATE_ARCHIVER_DELEGATE_CLASS: *const Class = ptr::null();
 static mut WINDOW_STATE_UNARCHIVER_CLASS: *const Class = ptr::null();
@@ -125,6 +126,18 @@ pub enum UserTabbingPreference {
 #[ctor(unsafe)]
 unsafe fn build_classes() {
     unsafe {
+        TITLEBAR_BUTTON_CLASS = {
+            let mut decl = ClassDecl::new("GPUITitlebarButton", class!(NSButton)).unwrap();
+            decl.add_method(
+                sel!(mouseEntered:),
+                titlebar_button_entered as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(mouseExited:),
+                titlebar_button_exited as extern "C" fn(&Object, Sel, id),
+            );
+            decl.register()
+        };
         WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
         PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
         VIEW_CLASS = {
@@ -524,6 +537,11 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
         );
 
         decl.add_method(
+            sel!(gpuiTitlebarButtonClicked:),
+            titlebar_button_clicked as extern "C" fn(&Object, Sel, id),
+        );
+
+        decl.add_method(
             sel!(moveTabToNewWindow:),
             move_tab_to_new_window as extern "C" fn(&Object, Sel, id),
         );
@@ -676,6 +694,19 @@ struct MacWindowState {
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     should_close_callback: Option<Box<dyn FnMut() -> bool>>,
+    /// Called with a titlebar button's index (`set_titlebar_buttons`).
+    titlebar_button_callback: Option<Box<dyn FnMut(usize)>>,
+    /// The accessory holding those buttons, retained, so the next call
+    /// can take it out again.
+    titlebar_buttons_accessory: Option<id>,
+    /// Called with a titlebar button's index and its bounds when the
+    /// pointer enters it, `None` when it leaves.
+    titlebar_button_hover_callback: Option<Box<dyn FnMut(usize, Option<Bounds<Pixels>>)>>,
+    /// Each titlebar button's hover ground, by its index.
+    titlebar_button_hovers: Vec<Option<gpui::Hsla>>,
+    /// The titlebar buttons drawn in the title's colour, owned by the
+    /// accessory; retinted when the window becomes or stops being key.
+    titlebar_title_ink_buttons: Vec<id>,
     close_callback: Option<Box<dyn FnOnce()>>,
     appearance_changed_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
@@ -1137,6 +1168,11 @@ impl MacWindow {
                 resize_callback: None,
                 moved_callback: None,
                 should_close_callback: None,
+                titlebar_button_callback: None,
+                titlebar_buttons_accessory: None,
+                titlebar_button_hover_callback: None,
+                titlebar_button_hovers: Vec::new(),
+                titlebar_title_ink_buttons: Vec::new(),
                 close_callback: None,
                 appearance_changed_callback: None,
                 input_handler: None,
@@ -2075,6 +2111,145 @@ impl PlatformWindow for MacWindow {
 
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.as_ref().lock().should_close_callback = Some(callback);
+    }
+
+    fn set_titlebar_buttons(
+        &self,
+        buttons: Vec<gpui::TitlebarButton>,
+        on_click: Box<dyn FnMut(usize)>,
+        on_hover: Box<dyn FnMut(usize, Option<Bounds<Pixels>>)>,
+    ) -> bool {
+        let (native_window, previous) = {
+            let mut lock = self.0.lock();
+            lock.titlebar_title_ink_buttons.clear();
+            lock.titlebar_button_callback = Some(on_click);
+            lock.titlebar_button_hover_callback = Some(on_hover);
+            lock.titlebar_button_hovers = buttons
+                .iter()
+                .map(|button| button.hover_background)
+                .collect();
+            (lock.native_window, lock.titlebar_buttons_accessory.take())
+        };
+        unsafe {
+            if let Some(previous) = previous {
+                let _: () = msg_send![previous, removeFromParentViewController];
+                let _: () = msg_send![previous, release];
+            }
+            if buttons.is_empty() {
+                return true;
+            }
+
+            // Plain image buttons in a row: template images, which the
+            // system tints and dims with the titlebar, and its tooltips.
+            let stack: id = msg_send![class!(NSStackView), new];
+            // NSUserInterfaceLayoutOrientationHorizontal, NSLayoutAttributeCenterY.
+            let _: () = msg_send![stack, setOrientation: 0isize];
+            let _: () = msg_send![stack, setAlignment: 10isize];
+            let _: () = msg_send![stack, setSpacing: 0.0f64];
+            let mut previous_control: id = nil;
+            let mut title_ink_buttons = Vec::new();
+            for (index, button) in buttons.iter().enumerate() {
+                let data: id = msg_send![class!(NSData),
+                    dataWithBytes: button.icon.as_ptr() as *const c_void
+                    length: button.icon.len()];
+                let image: id = msg_send![class!(NSImage), alloc];
+                let image: id = msg_send![image, initWithData: data];
+                if image.is_null() {
+                    continue;
+                }
+                let size = NSSize::new(
+                    f64::from(f32::from(button.icon_size.width)),
+                    f64::from(f32::from(button.icon_size.height)),
+                );
+                let _: () = msg_send![image, setSize: size];
+                let _: () = msg_send![image, setTemplate: YES];
+                let control: id = msg_send![TITLEBAR_BUTTON_CLASS, alloc];
+                let control: id = msg_send![control, init];
+                let _: () = msg_send![control, setImage: image];
+                let _: () = msg_send![image, release];
+                // NSImageOnly, and no bezel: the hover ground is ours.
+                let _: () = msg_send![control, setImagePosition: 1isize];
+                let _: () = msg_send![control, setBordered: NO];
+                let _: () = msg_send![control, setTarget: native_window];
+                let _: () = msg_send![control, setAction: sel!(gpuiTitlebarButtonClicked:)];
+                let _: () = msg_send![control, setTag: index as isize];
+                let _: () = msg_send![control, setEnabled: button.enabled as BOOL];
+                // A disabled one keeps the platform's dimmed look.
+                if button.title_ink && button.enabled {
+                    title_ink_buttons.push(control);
+                }
+                if let Some(tooltip) = &button.tooltip {
+                    let _: () = msg_send![control, setToolTip: ns_string(tooltip)];
+                }
+                let _: () = msg_send![control, setWantsLayer: YES];
+                let _: () = msg_send![control, setTranslatesAutoresizingMaskIntoConstraints: NO];
+                for (anchor, length) in [
+                    (sel!(widthAnchor), button.size.width),
+                    (sel!(heightAnchor), button.size.height),
+                ] {
+                    let anchor: id = msg_send![control, performSelector: anchor];
+                    let constraint: id = msg_send![anchor,
+                        constraintEqualToConstant: f64::from(f32::from(length))];
+                    let _: () = msg_send![constraint, setActive: YES];
+                }
+                // The pointer's way in and out, which the class answers.
+                // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                // NSTrackingInVisibleRect.
+                let tracking: id = msg_send![class!(NSTrackingArea), alloc];
+                let tracking: id = msg_send![tracking,
+                    initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
+                    options: 0x01usize | 0x80usize | 0x200usize
+                    owner: control
+                    userInfo: nil];
+                let _: () = msg_send![control, addTrackingArea: tracking];
+                let _: () = msg_send![tracking, release];
+                let _: () = msg_send![stack, addArrangedSubview: control];
+                if !previous_control.is_null() {
+                    let _: () = msg_send![stack,
+                        setCustomSpacing: f64::from(f32::from(button.gap_before))
+                        afterView: previous_control];
+                }
+                let _: () = msg_send![control, release];
+                previous_control = control;
+            }
+
+            // The titlebar's height, so the row sits in its middle, and
+            // a little room before the window's edge.
+            let frame: NSRect = msg_send![native_window, frame];
+            let content: NSRect = msg_send![native_window, contentLayoutRect];
+            let height = (frame.size.height - content.size.height).max(1.0);
+            let fitting: NSSize = msg_send![stack, fittingSize];
+            const EDGE: f64 = 8.0;
+            let container: id = msg_send![class!(NSView), alloc];
+            let container: id = msg_send![container,
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(fitting.width + EDGE, height),
+            )];
+            let _: () = msg_send![stack,
+            setFrame: NSRect::new(
+                NSPoint::new(0.0, ((height - fitting.height) / 2.0).max(0.0)),
+                fitting,
+            )];
+            let _: () = msg_send![container, addSubview: stack];
+            let _: () = msg_send![stack, release];
+
+            let controller: id = msg_send![class!(NSTitlebarAccessoryViewController), new];
+            let _: () = msg_send![controller, setView: container];
+            let _: () = msg_send![container, release];
+            // NSLayoutAttributeRight: after the title, at the far edge.
+            let _: () = msg_send![controller, setLayoutAttribute: 2isize];
+            // Straight to NSWindow's own: this class overrides the
+            // method to hide every accessory added (the native tab
+            // bar's), and these are meant to be seen.
+            let _: () = msg_send![super(&*native_window, class!(NSWindow)),
+                addTitlebarAccessoryViewController: controller];
+            tint_titlebar_buttons(&title_ink_buttons, native_window.isKeyWindow() == YES);
+            let mut lock = self.0.lock();
+            lock.titlebar_buttons_accessory = Some(controller);
+            lock.titlebar_title_ink_buttons = title_ink_buttons;
+        }
+        true
     }
 
     fn on_close(&self, callback: Box<dyn FnOnce()>) {
@@ -3175,6 +3350,8 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         return;
     }
 
+    unsafe { tint_titlebar_buttons(&lock.titlebar_title_ink_buttons, is_active) };
+
     let executor = lock.foreground_executor.clone();
     drop(lock);
 
@@ -3834,6 +4011,102 @@ unsafe fn remove_layer_background(layer: id) {
                 let sublayer = sublayers.objectAtIndex(i);
                 remove_layer_background(sublayer);
             }
+        }
+    }
+}
+
+/// A button of `set_titlebar_buttons` was clicked: its tag is its index.
+extern "C" fn titlebar_button_clicked(this: &Object, _: Sel, sender: id) {
+    let window_state = unsafe { get_window_state(this) };
+    let index: isize = unsafe { msg_send![sender, tag] };
+    let callback = window_state.lock().titlebar_button_callback.take();
+    if let Some(mut callback) = callback {
+        callback(index.max(0) as usize);
+        window_state.lock().titlebar_button_callback = Some(callback);
+    }
+}
+
+/// The pointer entered a titlebar button: its hover ground, and where
+/// it is, in the window's top-left coordinates, for a tooltip.
+extern "C" fn titlebar_button_entered(this: &Object, _: Sel, _event: id) {
+    unsafe {
+        let window: id = msg_send![this, window];
+        if window.is_null() {
+            return;
+        }
+        let window_state = get_window_state(&*window);
+        let index: isize = msg_send![this, tag];
+        let index = index.max(0) as usize;
+        let enabled: BOOL = msg_send![this, isEnabled];
+        let hover = window_state
+            .lock()
+            .titlebar_button_hovers
+            .get(index)
+            .copied()
+            .flatten();
+        if enabled == YES
+            && let Some(hover) = hover
+        {
+            let rgba = gpui::Rgba::from(hover);
+            let color: id = msg_send![class!(NSColor),
+                colorWithSRGBRed: f64::from(rgba.r)
+                green: f64::from(rgba.g)
+                blue: f64::from(rgba.b)
+                alpha: f64::from(rgba.a)];
+            let layer: id = msg_send![this, layer];
+            let cg_color: id = msg_send![color, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: cg_color];
+        }
+        let own: NSRect = msg_send![this, bounds];
+        let in_window: NSRect = msg_send![this, convertRect: own toView: nil];
+        let content: id = msg_send![window, contentView];
+        let content_frame: NSRect = msg_send![content, frame];
+        let top = content_frame.size.height - (in_window.origin.y + in_window.size.height);
+        let bounds = Bounds::new(
+            point(px(in_window.origin.x as f32), px(top as f32)),
+            size(
+                px(in_window.size.width as f32),
+                px(in_window.size.height as f32),
+            ),
+        );
+        let callback = window_state.lock().titlebar_button_hover_callback.take();
+        if let Some(mut callback) = callback {
+            callback(index, Some(bounds));
+            window_state.lock().titlebar_button_hover_callback = Some(callback);
+        }
+    }
+}
+
+/// Tint the titlebar buttons as the window's title is: the label colour
+/// while the window is key, the tertiary one, as the title dims, when not.
+unsafe fn tint_titlebar_buttons(buttons: &[id], is_key: bool) {
+    unsafe {
+        let color: id = if is_key {
+            msg_send![class!(NSColor), labelColor]
+        } else {
+            msg_send![class!(NSColor), tertiaryLabelColor]
+        };
+        for button in buttons {
+            let _: () = msg_send![*button, setContentTintColor: color];
+        }
+    }
+}
+
+/// The pointer left a titlebar button.
+extern "C" fn titlebar_button_exited(this: &Object, _: Sel, _event: id) {
+    unsafe {
+        let layer: id = msg_send![this, layer];
+        let _: () = msg_send![layer, setBackgroundColor: nil];
+        let window: id = msg_send![this, window];
+        if window.is_null() {
+            return;
+        }
+        let window_state = get_window_state(&*window);
+        let index: isize = msg_send![this, tag];
+        let callback = window_state.lock().titlebar_button_hover_callback.take();
+        if let Some(mut callback) = callback {
+            callback(index.max(0) as usize, None);
+            window_state.lock().titlebar_button_hover_callback = Some(callback);
         }
     }
 }
