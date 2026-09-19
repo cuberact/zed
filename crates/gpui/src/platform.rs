@@ -801,6 +801,36 @@ pub enum Decorations {
     },
 }
 
+/// A button placed in the window's native titlebar by
+/// [`Window::set_titlebar_buttons`], drawn and laid out by the platform.
+#[derive(Debug, Clone)]
+pub struct TitlebarButton {
+    /// The icon as PNG bytes. Used as a template image where the
+    /// platform has them — its shape only, tinted and dimmed by the
+    /// system with the titlebar — so draw it black on transparent at
+    /// twice `icon_size` for a sharp result on a Retina display.
+    pub icon: std::sync::Arc<[u8]>,
+    /// The size the icon is shown at, in points.
+    pub icon_size: Size<Pixels>,
+    /// The button's own size, the icon centred in it: what the hover
+    /// ground fills and the pointer finds.
+    pub size: Size<Pixels>,
+    /// Space before this button, after the one before it.
+    pub gap_before: Pixels,
+    /// The platform's own tooltip, or `None` where the application
+    /// shows its own (the hover callback says where the button is).
+    pub tooltip: Option<SharedString>,
+    /// Filled behind the button while the pointer is over it; `None`
+    /// for no hover ground.
+    pub hover_background: Option<Hsla>,
+    /// Whether the button can be clicked; a disabled one is dimmed.
+    pub enabled: bool,
+    /// Tint the icon in the window title's own colour — full while the
+    /// window is key, dimmed with the title when it is not — instead of
+    /// the platform's quieter tint for titlebar buttons.
+    pub title_ink: bool,
+}
+
 /// What window controls this platform supports
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct WindowControls {
@@ -1343,6 +1373,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn window_controls(&self) -> WindowControls {
         WindowControls::default()
+    }
+    /// Put `buttons` into the window's native titlebar, replacing any
+    /// put there before. `on_click` hears a button's index when it is
+    /// clicked, `on_hover` its index and its bounds in the window's
+    /// coordinates when the pointer enters it and `None` when it leaves.
+    /// `false` where the platform has no such place.
+    fn set_titlebar_buttons(
+        &self,
+        _buttons: Vec<TitlebarButton>,
+        _on_click: Box<dyn FnMut(usize)>,
+        _on_hover: Box<dyn FnMut(usize, Option<Bounds<Pixels>>)>,
+    ) -> bool {
+        false
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
