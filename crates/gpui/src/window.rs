@@ -1528,6 +1528,17 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
     window_bounds_ctor(Bounds::new(final_origin, base_size))
 }
 
+/// How [`Window::paint_image_with_sampling`] samples an image drawn at a size other than
+/// its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageSampling {
+    /// Interpolate between neighboring pixels; smooth when scaled.
+    #[default]
+    Linear,
+    /// Take the nearest pixel; every source pixel stays a sharp block when scaled up.
+    Nearest,
+}
+
 impl Window {
     pub(crate) fn new(
         handle: AnyWindowHandle,
@@ -4832,7 +4843,7 @@ impl Window {
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
-                pad: 0,
+                nearest: false.into(),
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
@@ -4926,6 +4937,30 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with_sampling(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            ImageSampling::Linear,
+        )
+    }
+
+    /// Like [`Window::paint_image`], with a choice of how the image is sampled when it is
+    /// drawn at a size other than its own. [`ImageSampling::Nearest`] keeps every source
+    /// pixel a sharp block, which is what a magnifier or a pixel-art viewer wants.
+    pub fn paint_image_with_sampling(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        sampling: ImageSampling,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let visible_bounds = bounds.intersect(&image_bounds);
@@ -5004,7 +5039,7 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
-            pad: 0,
+            nearest: (sampling == ImageSampling::Nearest).into(),
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
