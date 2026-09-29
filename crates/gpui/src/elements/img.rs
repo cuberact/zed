@@ -1,9 +1,9 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_static_image,
-    decode_static_image_from_decoder, px,
+    Entity, GlobalElementId, Hitbox, Image, ImageCache, ImageSampling, InspectorElementId,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
+    RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window,
+    decode_static_image, decode_static_image_from_decoder, px,
 };
 use anyhow::Result;
 
@@ -129,6 +129,7 @@ where
 pub struct ImageStyle {
     grayscale: bool,
     object_fit: ObjectFit,
+    sampling: ImageSampling,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
 }
@@ -138,6 +139,7 @@ impl Default for ImageStyle {
         Self {
             grayscale: false,
             object_fit: ObjectFit::Contain,
+            sampling: ImageSampling::Linear,
             loading: None,
             fallback: None,
         }
@@ -158,6 +160,13 @@ pub trait StyledImage: Sized {
     /// Set the object fit for the image.
     fn object_fit(mut self, object_fit: ObjectFit) -> Self {
         self.image_style().object_fit = object_fit;
+        self
+    }
+
+    /// Set how the image is sampled when drawn at a size other than its own:
+    /// smoothed (the default), or its pixels kept square (`ImageSampling::Nearest`).
+    fn sampling(mut self, sampling: ImageSampling) -> Self {
+        self.image_style().sampling = sampling;
         self
     }
 
@@ -493,13 +502,14 @@ impl Element for Img {
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
                     window
-                        .paint_image(
+                        .paint_image_with_sampling(
                             bounds,
                             new_bounds,
                             corner_radii,
                             data,
                             layout_state.frame_index,
                             self.style.grayscale,
+                            self.style.sampling,
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {
