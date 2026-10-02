@@ -176,6 +176,12 @@ impl WgpuAtlasTextures {
             }
         }
 
+        // No texture can hold it, so don't leave an empty one behind.
+        let max_texture_size = DevicePixels(self.max_texture_size as i32);
+        if size.width > max_texture_size || size.height > max_texture_size {
+            return None;
+        }
+
         let texture = self.push_texture(size, texture_kind);
         texture.allocate(size)
     }
