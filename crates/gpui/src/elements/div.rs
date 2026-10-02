@@ -49,7 +49,8 @@ type StackSafe<T> = stacksafe::StackSafe<T>;
 #[cfg(not(feature = "stacker"))]
 type StackSafe<T> = T;
 
-const DRAG_THRESHOLD: f64 = 2.;
+// What a click's natural wobble stays under; at 2 px an unsteady click became a drag.
+const DRAG_THRESHOLD: f64 = 6.;
 const DEFAULT_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
 
