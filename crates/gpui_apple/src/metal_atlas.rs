@@ -11,6 +11,12 @@ use std::borrow::Cow;
 
 pub struct MetalAtlas(Mutex<AtlasState<MetalAtlasTextures>>);
 
+// Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
+const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
+    width: DevicePixels(16384),
+    height: DevicePixels(16384),
+};
+
 impl MetalAtlas {
     pub(crate) fn new(device: Device, supports_shared_storage: bool) -> Self {
         MetalAtlas(Mutex::new(AtlasState::new(MetalAtlasTextures {
@@ -117,6 +123,11 @@ impl MetalAtlasTextures {
             }
         }
 
+        // No texture can hold it, so don't leave an empty one behind.
+        if size.width > MAX_ATLAS_SIZE.width || size.height > MAX_ATLAS_SIZE.height {
+            return None;
+        }
+
         let texture = self.push_texture(size, texture_kind);
         texture.allocate(size)
     }
@@ -129,11 +140,6 @@ impl MetalAtlasTextures {
         const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(1024),
             height: DevicePixels(1024),
-        };
-        // Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
-        const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(16384),
-            height: DevicePixels(16384),
         };
         let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
         let texture_descriptor = metal::TextureDescriptor::new();
@@ -392,6 +398,35 @@ mod tests {
         atlas.remove(&big_key_a);
         let tile_b = insert_tile(&atlas, big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    #[test]
+    fn test_oversized_tile_leaves_no_texture_behind() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let too_wide = Size {
+            width: MAX_ATLAS_SIZE.width + DevicePixels(1),
+            height: DevicePixels(1),
+        };
+
+        // Every paint retries a failed insert, so none may grow the atlas.
+        for _ in 0..2 {
+            let result = atlas.get_or_insert_with(make_image_key(1, 0), &mut || {
+                let byte_count = (too_wide.width.0 as usize) * 4;
+                Ok(Some((too_wide, Cow::Owned(vec![0u8; byte_count]))))
+            });
+            assert!(result.is_err());
+        }
+        assert!(
+            atlas
+                .0
+                .lock()
+                .backend
+                .polychrome_textures
+                .textures
+                .is_empty()
+        );
     }
 
     #[test]
