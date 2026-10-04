@@ -3334,6 +3334,17 @@ impl Image {
             .and_then(|result| result.ok())
     }
 
+    /// Like [`Self::use_render_image`], but keeping the error: `None`
+    /// while the image is still being decoded, `Some(Err(_))` once it
+    /// has failed to decode.
+    pub fn use_render_image_result(
+        self: Arc<Self>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, crate::ImageCacheError>> {
+        ImageSource::Image(self).use_data(None, window, cx)
+    }
+
     /// Use the GPUI `get_asset` API to make this image renderable
     pub fn get_render_image(
         self: Arc<Self>,
