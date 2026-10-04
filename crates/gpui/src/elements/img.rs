@@ -846,6 +846,45 @@ mod tests {
     }
 
     #[gpui::test]
+    fn undecodable_image_reports_an_error_rather_than_loading(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let image = Arc::new(Image::from_bytes(
+            crate::ImageFormat::Png,
+            b"not a png".to_vec(),
+        ));
+        let answers = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ask = |window: &mut crate::VisualTestContext| {
+            let image = image.clone();
+            let answers = answers.clone();
+            window.draw(
+                point(px(0.), px(0.)),
+                size(px(10.), px(10.)),
+                move |_, _| {
+                    canvas(
+                        move |_, window, cx| {
+                            let root = window.root.as_ref().expect("a root view").entity_id();
+                            window.with_rendered_view(root, |window| {
+                                let result = image.clone().use_render_image_result(window, cx);
+                                let render_image = image.use_render_image(window, cx);
+                                answers.borrow_mut().push((result, render_image));
+                            });
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .into_any_element()
+                },
+            );
+        };
+        ask(window);
+        window.run_until_parked();
+        ask(window);
+        let answers = answers.borrow();
+        let (result, render_image) = answers.last().expect("asked");
+        assert!(matches!(result, Some(Err(_))));
+        assert!(render_image.is_none());
+    }
+
+    #[gpui::test]
     fn zero_frame_image_does_not_panic_on_paint(cx: &mut TestAppContext) {
         cx.add_empty_window()
             .draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
