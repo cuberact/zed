@@ -6,6 +6,7 @@ use image::Frame;
 use resvg::tiny_skia::Pixmap;
 use smallvec::SmallVec;
 use std::{
+    cell::Cell,
     hash::Hash,
     sync::{Arc, LazyLock, OnceLock},
 };
@@ -77,6 +78,10 @@ fn select_emoji_font(
     None
 }
 
+thread_local! {
+    static SKIPPED_IMAGES: Cell<usize> = const { Cell::new(0) };
+}
+
 /// When rendering SVGs, we render them at twice the size to get a higher-quality result.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
 
@@ -100,7 +105,18 @@ pub struct SvgRenderer {
 /// [`SvgRenderer::render_parsed`]. Parsing resolves fonts and converts text
 /// to paths, so callers that need to rasterize the same SVG at multiple
 /// scales should retain this value to avoid re-paying the parse cost.
-pub struct ParsedSvg(usvg::Tree);
+pub struct ParsedSvg {
+    tree: usvg::Tree,
+    skipped_images: usize,
+}
+
+impl ParsedSvg {
+    /// How many images the document links to by a path or a URL. None of
+    /// them is loaded; only images embedded as `data:` URLs are drawn.
+    pub fn skipped_images(&self) -> usize {
+        self.skipped_images
+    }
+}
 
 /// The size in which to rasterize the SVG.
 #[derive(Clone, Copy)]
@@ -178,6 +194,16 @@ impl SvgRenderer {
                 select_font: font_resolver,
                 select_fallback: fallback_selection,
             },
+            // An SVG drawn as an image loads nothing from outside itself (SVG 2's
+            // secure static mode): an href is any local path, a device or FIFO
+            // that never ends, or a network share the OS will authenticate to.
+            image_href_resolver: usvg::ImageHrefResolver {
+                resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+                resolve_string: Box::new(|_, _| {
+                    SKIPPED_IMAGES.with(|count| count.set(count.get() + 1));
+                    None
+                }),
+            },
             ..Default::default()
         };
         Self {
@@ -188,7 +214,12 @@ impl SvgRenderer {
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
-        usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+        SKIPPED_IMAGES.with(|count| count.set(0));
+        let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
+        Ok(ParsedSvg {
+            tree,
+            skipped_images: SKIPPED_IMAGES.with(Cell::take),
+        })
     }
 
     /// Rasterizes a previously parsed SVG into an image buffer.
@@ -205,7 +236,7 @@ impl SvgRenderer {
                 SMOOTH_SVG_SCALE_FACTOR,
             ),
         };
-        let pixmap = rasterize_tree(&svg.0, size)?;
+        let pixmap = rasterize_tree(&svg.tree, size)?;
         let mut buffer =
             image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
 
@@ -387,6 +418,43 @@ mod tests {
         )?;
 
         assert_eq!(image.size(0), Size::new(DevicePixels(24), DevicePixels(12)));
+        Ok(())
+    }
+
+    #[test]
+    fn draws_embedded_images_but_never_reads_linked_ones() -> Result<()> {
+        let red_square = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="red"/></svg>"#;
+        let linked = std::env::temp_dir().join(format!("gpui-linked-{}.svg", std::process::id()));
+        std::fs::write(&linked, red_square)?;
+        let embedded = format!(
+            "data:image/svg+xml,{}",
+            red_square
+                .replace('<', "%3C")
+                .replace('>', "%3E")
+                .replace('"', "%22")
+                .replace('#', "%23")
+        );
+
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let drawn = |href: &str| -> Result<(usize, Vec<u8>)> {
+            let svg = renderer.parse_svg(
+                format!(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><image href="{href}" width="1" height="1"/></svg>"#
+                )
+                .as_bytes(),
+            )?;
+            let size = Size::new(DevicePixels(1), DevicePixels(1));
+            let image = renderer.render_parsed(&svg, SvgSize::ExactSize(size))?;
+            Ok((
+                svg.skipped_images(),
+                image.as_bytes(0).unwrap_or_default().to_vec(),
+            ))
+        };
+        let from_disk = drawn(&linked.to_string_lossy());
+        std::fs::remove_file(&linked)?;
+
+        assert_eq!(from_disk?, (1, vec![0, 0, 0, 0]));
+        assert_eq!(drawn(&embedded)?, (0, vec![0, 0, 255, 255]));
         Ok(())
     }
 
