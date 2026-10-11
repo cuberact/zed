@@ -104,6 +104,10 @@ unsafe fn build_classes() {
                 should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
             );
             decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
+            );
+            decl.add_method(
                 sel!(applicationWillTerminate:),
                 will_terminate as extern "C" fn(&mut Object, Sel, id),
             );
@@ -203,6 +207,10 @@ pub(crate) struct MacPlatformState {
     on_system_wake: Option<Box<dyn FnMut()>>,
     system_power_observers_registered: bool,
     quit: Option<Box<dyn FnMut() -> bool>>,
+    should_quit: Option<Box<dyn FnMut() -> bool>>,
+    /// `Platform::quit` was called: the application asked to quit, and
+    /// `should_quit` is not asked about it.
+    quitting: bool,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -266,6 +274,8 @@ impl MacPlatform {
             find_pasteboard: Pasteboard::find(),
             reopen: None,
             quit: None,
+            should_quit: None,
+            quitting: false,
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
@@ -606,6 +616,7 @@ impl Platform for MacPlatform {
         // this, we make quitting the application asynchronous so that we aren't holding borrows to
         // the app state on the stack when we actually terminate the app.
 
+        self.0.lock().quitting = true;
         unsafe {
             DispatchQueue::main().exec_async_f(ptr::null_mut(), quit);
         }
@@ -1072,6 +1083,10 @@ impl Platform for MacPlatform {
         self.0.lock().quit = Some(callback);
     }
 
+    fn on_should_quit(&self, callback: Box<dyn FnMut() -> bool>) {
+        self.0.lock().should_quit = Some(callback);
+    }
+
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().reopen = Some(callback);
     }
@@ -1485,6 +1500,29 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
             callback();
             platform.0.lock().reopen.get_or_insert(callback);
         }
+    }
+}
+
+/// `NSTerminateCancel` and `NSTerminateNow` of `NSApplicationTerminateReply`.
+const TERMINATE_CANCEL: NSUInteger = 0;
+const TERMINATE_NOW: NSUInteger = 1;
+
+extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
+    let platform = unsafe { get_mac_platform(this) };
+    let mut lock = platform.0.lock();
+    if lock.quitting {
+        return TERMINATE_NOW;
+    }
+    let Some(mut callback) = lock.should_quit.take() else {
+        return TERMINATE_NOW;
+    };
+    drop(lock);
+    let quit = callback();
+    platform.0.lock().should_quit.get_or_insert(callback);
+    if quit {
+        TERMINATE_NOW
+    } else {
+        TERMINATE_CANCEL
     }
 }
 

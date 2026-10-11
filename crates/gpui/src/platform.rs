@@ -455,6 +455,12 @@ pub trait Platform: 'static {
     fn open_with_system(&self, path: &Path);
 
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>);
+    /// Registers the callback asked before the application quits at
+    /// the system's request (the Dock's Quit, a logout, an AppleScript
+    /// `quit`); `false` keeps it running. A quit the application asked
+    /// for itself (`App::quit`) is not asked about. Platforms with no
+    /// such question never call it.
+    fn on_should_quit(&self, _callback: Box<dyn FnMut() -> bool>) {}
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
     /// Registers the callback invoked when the system is about to sleep.
     fn on_system_sleep(&self, callback: Box<dyn FnMut()>);
