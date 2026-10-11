@@ -312,6 +312,32 @@ impl Application {
         self
     }
 
+    /// Asks `callback` whether the application may quit when the system asks it to: the
+    /// Dock's Quit, a logout or a restart, an AppleScript `quit`. Returning `false` keeps it
+    /// running, before anything has closed. [`App::quit`] is never asked. macOS only; on other
+    /// platforms the callback is never called.
+    pub fn on_should_quit<F>(&self, mut callback: F) -> &Self
+    where
+        F: 'static + FnMut(&mut App) -> bool,
+    {
+        let this = Rc::downgrade(&self.0);
+        self.0
+            .borrow_mut()
+            .platform
+            .on_should_quit(Box::new(move || {
+                let Some(app) = this.upgrade() else {
+                    return true;
+                };
+                // Asked while the app is borrowed: there is no asking it, and
+                // the quit goes on as it would without the callback.
+                match app.try_borrow_mut() {
+                    Ok(mut cx) => callback(&mut cx),
+                    Err(_) => true,
+                }
+            }));
+        self
+    }
+
     /// Returns a handle to the [`BackgroundExecutor`] associated with this app, which can be used to spawn futures in the background.
     pub fn background_executor(&self) -> BackgroundExecutor {
         self.0.borrow().background_executor.clone()
