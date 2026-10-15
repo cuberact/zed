@@ -1182,9 +1182,9 @@ impl accesskit::ActionHandler for A11yActionHandler {
 
 /// Drags `paths` out of `hwnd` the way Explorer drags files: the data object
 /// their folder gives for them, with `CF_HDROP` and the shell's own formats
-/// that Explorer and other file managers read, and the shell's drag loop,
-/// drag image and drop source. Copy only, as on macOS for a drag that leaves
-/// the application. Blocks until the drop.
+/// that Explorer and other file managers read, and the shell's drag loop and
+/// drag image. The source decides the operation, not the target: a copy, or a
+/// move while Shift is held (`FileDragSource`). Blocks until the drop.
 pub(crate) fn start_file_drag(hwnd: HWND, paths: &[PathBuf]) -> windows::core::Result<DROPEFFECT> {
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 
@@ -1225,12 +1225,83 @@ pub(crate) fn start_file_drag(hwnd: HWND, paths: &[PathBuf]) -> windows::core::R
         // SAFETY: the item IDs stay alive until after the drag; the data
         // object keeps copies of its own.
         let data: IDataObject = unsafe { shell_folder.GetUIObjectOf(hwnd, &children, None)? };
-        unsafe { SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY) }
+        // The operations a drag allows are fixed when it starts, and the
+        // target picks among them. So it allows one, and when Shift changes
+        // the drag ends and starts again over the same spot with the other.
+        DRAGGING_FILES_OUT.set(true);
+        let result = loop {
+            let shift_changed = Rc::new(Cell::new(false));
+            let moving = current_modifiers().shift;
+            let source: IDropSource = FileDragSource {
+                moving,
+                shift_changed: shift_changed.clone(),
+            }
+            .into();
+            let effect = if moving {
+                DROPEFFECT_MOVE
+            } else {
+                DROPEFFECT_COPY
+            };
+            let result = unsafe { SHDoDragDrop(Some(hwnd), &data, &source, effect) };
+            if !shift_changed.get() {
+                break result;
+            }
+        };
+        DRAGGING_FILES_OUT.set(false);
+        result
     })();
     for item in items.into_iter().chain(folder) {
         unsafe { ILFree(Some(item.cast_const())) };
     }
     result
+}
+
+thread_local! {
+    /// A drag `start_file_drag` began is in progress: one that comes back
+    /// over a window of the application offers a move alone while Shift is
+    /// held, and the window takes it (`drop_effect`).
+    static DRAGGING_FILES_OUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The effect a window answers a drag over it with: a copy, which the
+/// application turns into a move by the modifiers itself, or a move where
+/// its own drag offers nothing else.
+fn drop_effect(allowed: DROPEFFECT) -> DROPEFFECT {
+    if DRAGGING_FILES_OUT.get() && allowed == DROPEFFECT_MOVE {
+        DROPEFFECT_MOVE
+    } else {
+        DROPEFFECT_COPY
+    }
+}
+
+/// The drop source of `start_file_drag`: Escape cancels and releasing the
+/// button drops, as the shell's own does, and a change of Shift ends the
+/// drag for it to start again with the other operation.
+#[implement(IDropSource)]
+struct FileDragSource {
+    moving: bool,
+    shift_changed: Rc<Cell<bool>>,
+}
+
+#[allow(non_snake_case)]
+impl IDropSource_Impl for FileDragSource_Impl {
+    fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
+        if fescapepressed.as_bool() {
+            return DRAGDROP_S_CANCEL;
+        }
+        if grfkeystate.0 & MK_LBUTTON.0 == 0 {
+            return DRAGDROP_S_DROP;
+        }
+        if (grfkeystate.0 & MK_SHIFT.0 != 0) != self.moving {
+            self.shift_changed.set(true);
+            return DRAGDROP_S_CANCEL;
+        }
+        S_OK
+    }
+
+    fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
 }
 
 #[implement(IDropTarget)]
@@ -1265,7 +1336,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             };
             let cursor_position = POINT { x: pt.x, y: pt.y };
             if idata_obj.QueryGetData(&config as _) == S_OK {
-                *pdweffect = DROPEFFECT_COPY;
+                *pdweffect = drop_effect(*pdweffect);
                 let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
                     return Ok(());
                 };
@@ -1313,7 +1384,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows::core::Result<()> {
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
+            *pdweffect = drop_effect(*pdweffect);
             self.0
                 .drop_target_helper
                 .DragOver(&cursor_position, *pdweffect)
@@ -1355,7 +1426,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         let idata_obj = pdataobj.ok()?;
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY;
+            *pdweffect = drop_effect(*pdweffect);
             self.0
                 .drop_target_helper
                 .Drop(idata_obj, &cursor_position, *pdweffect)
