@@ -527,6 +527,10 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
                 as extern "C" fn(&Object, Sel, id, NSInteger) -> NSDragOperation,
         );
         decl.add_method(
+            sel!(ignoreModifierKeysForDraggingSession:),
+            ignore_modifier_keys_for_dragging_session as extern "C" fn(&Object, Sel, id) -> BOOL,
+        );
+        decl.add_method(
             sel!(draggingSession:endedAtPoint:operation:),
             dragging_session_ended as extern "C" fn(&Object, Sel, id, NSPoint, NSDragOperation),
         );
@@ -3871,7 +3875,13 @@ extern "C" fn dragging_session_source_operation_mask(
     context: NSInteger,
 ) -> NSDragOperation {
     let operation = match context {
-        NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => NSDragOperationCopy,
+        // Out of the application the source decides, not the destination:
+        // a copy, or a move while Command is held. Asked again as the drag
+        // goes on, so a key pressed mid-drag counts.
+        NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => match current_modifiers().platform {
+            true => NSDragOperationMove,
+            false => NSDragOperationCopy,
+        },
         NSDRAGGING_CONTEXT_WITHIN_APPLICATION => NSDragOperationCopy | NSDragOperationMove,
         _ => NSDragOperationCopy | NSDragOperationMove,
     };
@@ -3881,6 +3891,13 @@ extern "C" fn dragging_session_source_operation_mask(
         operation
     );
     operation
+}
+
+/// The operation mask above already reads the modifiers; AppKit's own
+/// reading of them (Command as `NSDragOperationGeneric`) would leave a move
+/// outside the application nothing to match.
+extern "C" fn ignore_modifier_keys_for_dragging_session(_: &Object, _: Sel, _: id) -> BOOL {
+    YES
 }
 
 extern "C" fn dragging_session_ended(
