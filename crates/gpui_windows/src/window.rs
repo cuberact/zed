@@ -1180,33 +1180,54 @@ impl accesskit::ActionHandler for A11yActionHandler {
     }
 }
 
-/// Drags `paths` out of `hwnd` the way the shell drags files: a data object
-/// the shell builds for them, with `CF_HDROP` and its own formats that
-/// Explorer and other file managers read, and the shell's drag loop, drag
-/// image and drop source. Copy only, as on macOS for a drag that leaves the
-/// application. Blocks until the drop.
+/// Drags `paths` out of `hwnd` the way Explorer drags files: the data object
+/// their folder gives for them, with `CF_HDROP` and the shell's own formats
+/// that Explorer and other file managers read, and the shell's drag loop,
+/// drag image and drop source. Copy only, as on macOS for a drag that leaves
+/// the application. Blocks until the drop.
 pub(crate) fn start_file_drag(hwnd: HWND, paths: &[PathBuf]) -> windows::core::Result<DROPEFFECT> {
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 
-    // Absolute item IDs, so the files may come from different folders: with
-    // no parent folder given, the desktop is theirs.
+    let id_of =
+        |path: &std::path::Path| unsafe { ILCreateFromPathW(&HSTRING::from(path.as_os_str())) };
     let items: Vec<*mut ITEMIDLIST> = paths
         .iter()
-        .map(|path| unsafe { ILCreateFromPathW(&HSTRING::from(path.as_os_str())) })
+        .map(|path| id_of(path))
         .filter(|item| !item.is_null())
         .collect();
+    // The folder the files are in, each file asked for as an item of it.
+    // Files from several folders are asked of the desktop, the root of the
+    // namespace, by their whole IDs.
+    let folder = paths
+        .first()
+        .and_then(|first| first.parent())
+        .filter(|parent| paths.iter().all(|path| path.parent() == Some(parent)))
+        .map(id_of)
+        .filter(|folder| !folder.is_null());
     let result = (|| -> windows::core::Result<DROPEFFECT> {
         if items.is_empty() {
             return Err(E_INVALIDARG.into());
         }
-        let children: Vec<*const ITEMIDLIST> = items.iter().map(|item| item.cast_const()).collect();
+        let desktop = unsafe { SHGetDesktopFolder()? };
+        let (shell_folder, children): (IShellFolder, Vec<*const ITEMIDLIST>) = match folder {
+            Some(folder) => (
+                unsafe { desktop.BindToObject(folder, None::<&IBindCtx>)? },
+                items
+                    .iter()
+                    .map(|item| unsafe { ILFindLastID(*item) }.cast_const())
+                    .collect(),
+            ),
+            None => (
+                desktop,
+                items.iter().map(|item| item.cast_const()).collect(),
+            ),
+        };
         // SAFETY: the item IDs stay alive until after the drag; the data
         // object keeps copies of its own.
-        let data: IDataObject =
-            unsafe { SHCreateDataObject(None, Some(&children), None::<&IDataObject>)? };
+        let data: IDataObject = unsafe { shell_folder.GetUIObjectOf(hwnd, &children, None)? };
         unsafe { SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY) }
     })();
-    for item in items {
+    for item in items.into_iter().chain(folder) {
         unsafe { ILFree(Some(item.cast_const())) };
     }
     result
