@@ -1745,23 +1745,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn modifiers(&self) -> Modifiers {
-        unsafe {
-            let modifiers: NSEventModifierFlags = msg_send![class!(NSEvent), modifierFlags];
-
-            let control = modifiers.contains(NSEventModifierFlags::NSControlKeyMask);
-            let alt = modifiers.contains(NSEventModifierFlags::NSAlternateKeyMask);
-            let shift = modifiers.contains(NSEventModifierFlags::NSShiftKeyMask);
-            let command = modifiers.contains(NSEventModifierFlags::NSCommandKeyMask);
-            let function = modifiers.contains(NSEventModifierFlags::NSFunctionKeyMask);
-
-            Modifiers {
-                control,
-                alt,
-                shift,
-                platform: command,
-                function,
-            }
-        }
+        current_modifiers()
     }
 
     fn capslock(&self) -> Capslock {
@@ -3930,6 +3914,27 @@ fn synthetic_drag_button_is_pressed(button: Option<MouseButton>, pressed: NSUInt
     pressed & (1 << bit) != 0
 }
 
+/// The modifier keys held down now, whatever event is being handled.
+fn current_modifiers() -> Modifiers {
+    unsafe {
+        let modifiers: NSEventModifierFlags = msg_send![class!(NSEvent), modifierFlags];
+
+        let control = modifiers.contains(NSEventModifierFlags::NSControlKeyMask);
+        let alt = modifiers.contains(NSEventModifierFlags::NSAlternateKeyMask);
+        let shift = modifiers.contains(NSEventModifierFlags::NSShiftKeyMask);
+        let command = modifiers.contains(NSEventModifierFlags::NSCommandKeyMask);
+        let function = modifiers.contains(NSEventModifierFlags::NSFunctionKeyMask);
+
+        Modifiers {
+            control,
+            alt,
+            shift,
+            platform: command,
+            function,
+        }
+    }
+}
+
 async fn synthetic_drag(
     window_state: Weak<Mutex<MacWindowState>>,
     drag_id: usize,
@@ -3954,7 +3959,14 @@ async fn synthetic_drag(
         }
         if let Some(mut callback) = lock.event_callback.take() {
             drop(lock);
-            callback(PlatformInput::MouseMove(event.clone()));
+            // With the modifiers held now, not those of the move being
+            // replayed: a key pressed while the pointer rests would otherwise
+            // be undone by the next replay.
+            let event = MouseMoveEvent {
+                modifiers: current_modifiers(),
+                ..event.clone()
+            };
+            callback(PlatformInput::MouseMove(event));
             window_state.lock().event_callback = Some(callback);
         }
     }
