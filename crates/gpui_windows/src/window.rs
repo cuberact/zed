@@ -79,6 +79,9 @@ pub struct WindowsWindowState {
     /// Shared with [`WindowsPlatformState::cursor_visible`].
     pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
+    /// The files `start_external_drag` was handed, until the drag starts
+    /// on `WM_GPUI_START_EXTERNAL_DRAG`.
+    pub pending_external_drag: Cell<Option<Vec<PathBuf>>>,
 
     pub display: Cell<WindowsDisplay>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
@@ -183,6 +186,7 @@ impl WindowsWindowState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
+            pending_external_drag: Cell::new(None),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
@@ -1072,6 +1076,41 @@ impl PlatformWindow for WindowsWindow {
         self.0.update_ime_position(self.0.hwnd, caret_position);
     }
 
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+
+    fn start_external_drag(&self, payload: &ExternalDragPayload) -> bool {
+        let ExternalDragPayload::Files(paths) = payload;
+        let paths: Vec<PathBuf> = paths
+            .entries()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        if paths.is_empty() {
+            return false;
+        }
+        // The shell's drag loop is modal. Started from here, it would run
+        // inside the event being dispatched, and every message it pumps for
+        // this window, the drop target's among them, would find the input
+        // callback taken. It starts on a message of its own instead, once
+        // this event is done.
+        self.state.pending_external_drag.set(Some(paths));
+        let posted = unsafe {
+            PostMessageW(
+                Some(self.hwnd),
+                WM_GPUI_START_EXTERNAL_DRAG,
+                WPARAM::default(),
+                LPARAM::default(),
+            )
+        };
+        if posted.log_err().is_none() {
+            self.state.pending_external_drag.take();
+            return false;
+        }
+        true
+    }
+
     fn play_system_bell(&self) {
         // MB_OK: The sound specified as the Windows Default Beep sound.
         let _ = unsafe { MessageBeep(MB_OK) };
@@ -1139,6 +1178,38 @@ impl accesskit::ActionHandler for A11yActionHandler {
     fn do_action(&mut self, request: accesskit::ActionRequest) {
         (self.0)(request);
     }
+}
+
+/// Drags `paths` out of `hwnd` the way the shell drags files: a data object
+/// the shell builds for them, with `CF_HDROP` and its own formats that
+/// Explorer and other file managers read, and the shell's drag loop, drag
+/// image and drop source. Copy only, as on macOS for a drag that leaves the
+/// application. Blocks until the drop.
+pub(crate) fn start_file_drag(hwnd: HWND, paths: &[PathBuf]) -> windows::core::Result<DROPEFFECT> {
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+
+    // Absolute item IDs, so the files may come from different folders: with
+    // no parent folder given, the desktop is theirs.
+    let items: Vec<*mut ITEMIDLIST> = paths
+        .iter()
+        .map(|path| unsafe { ILCreateFromPathW(&HSTRING::from(path.as_os_str())) })
+        .filter(|item| !item.is_null())
+        .collect();
+    let result = (|| -> windows::core::Result<DROPEFFECT> {
+        if items.is_empty() {
+            return Err(E_INVALIDARG.into());
+        }
+        let children: Vec<*const ITEMIDLIST> = items.iter().map(|item| item.cast_const()).collect();
+        // SAFETY: the item IDs stay alive until after the drag; the data
+        // object keeps copies of its own.
+        let data: IDataObject =
+            unsafe { SHCreateDataObject(None, Some(&children), None::<&IDataObject>)? };
+        unsafe { SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY) }
+    })();
+    for item in items {
+        unsafe { ILFree(Some(item.cast_const())) };
+    }
+    result
 }
 
 #[implement(IDropTarget)]
