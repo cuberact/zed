@@ -1300,6 +1300,12 @@ impl MacWindow {
                     add_mouse_tracking_area(tracking_view);
 
                     native_window.setLevel_(NSPopUpWindowLevel);
+                    // A nonactivating panel still becomes key when clicked
+                    // unless it only does so for a view that asks for the
+                    // keyboard, and the GPUI view never asks: a click in a
+                    // popup leaves its parent key, as a click in a native
+                    // menu does, and the parent keeps the keystrokes.
+                    let _: () = msg_send![native_window, setBecomesKeyOnlyIfNeeded: YES];
                     let _: () = msg_send![
                         native_window,
                         setAnimationBehavior: NSWindowAnimationBehaviorUtilityWindow
