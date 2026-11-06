@@ -15,7 +15,7 @@ use crate::{
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
@@ -199,6 +199,14 @@ pub enum ListMeasuringBehavior {
     /// Measure all items in the list.
     /// Note: This can be expensive for the first frame in a large list.
     Measure(bool),
+    /// Measure all items in the list, a slice of them per frame: each frame
+    /// measures items until `budget` is spent and then asks for another frame.
+    MeasureInSlices {
+        /// The time a frame may spend measuring items that are out of sight.
+        budget: Duration,
+        /// Whether every item has been measured.
+        has_measured: bool,
+    },
     /// Only measure visible items
     #[default]
     Visible,
@@ -207,8 +215,17 @@ pub enum ListMeasuringBehavior {
 impl ListMeasuringBehavior {
     fn reset(&mut self) {
         match self {
-            ListMeasuringBehavior::Measure(has_measured) => *has_measured = false,
+            ListMeasuringBehavior::Measure(has_measured)
+            | ListMeasuringBehavior::MeasureInSlices { has_measured, .. } => *has_measured = false,
             ListMeasuringBehavior::Visible => {}
+        }
+    }
+
+    fn has_measured(&self) -> bool {
+        match self {
+            ListMeasuringBehavior::Measure(has_measured)
+            | ListMeasuringBehavior::MeasureInSlices { has_measured, .. } => *has_measured,
+            ListMeasuringBehavior::Visible => true,
         }
     }
 }
@@ -336,6 +353,24 @@ impl ListState {
     pub fn measure_all(self) -> Self {
         self.0.borrow_mut().measuring_behavior = ListMeasuringBehavior::Measure(false);
         self
+    }
+
+    /// Like [`Self::measure_all`], but each frame spends at most about `budget` measuring
+    /// items out of sight and leaves the rest to the frames after it, so a long list does not
+    /// hold up the window. When the list's width changes, the heights measured at the old width
+    /// stay as hints until the items are measured again, so the scrollbar keeps its size.
+    pub fn measure_all_in_slices(self, budget: Duration) -> Self {
+        self.0.borrow_mut().measuring_behavior = ListMeasuringBehavior::MeasureInSlices {
+            budget,
+            has_measured: false,
+        };
+        self
+    }
+
+    /// Whether some item has no height yet, neither measured nor hinted, so the list's total
+    /// height, and a scrollbar sized from it, is still short of the real one.
+    pub fn has_unknown_heights(&self) -> bool {
+        self.0.borrow().items.summary().has_unknown_height
     }
 
     /// Pre-populate every unmeasured item with a uniform height hint so the scrollbar thumb
@@ -989,7 +1024,7 @@ impl StateInner {
         window: &mut Window,
         cx: &mut App,
     ) {
-        match &mut self.measuring_behavior {
+        let budget = match &mut self.measuring_behavior {
             ListMeasuringBehavior::Visible => {
                 return;
             }
@@ -998,8 +1033,19 @@ impl StateInner {
                     return;
                 }
                 *has_measured = true;
+                None
             }
-        }
+            ListMeasuringBehavior::MeasureInSlices {
+                budget,
+                has_measured,
+            } => {
+                if *has_measured {
+                    return;
+                }
+                *has_measured = true;
+                Some(*budget)
+            }
+        };
 
         let mut cursor = self.items.cursor::<Count>(());
         let available_item_space = size(
@@ -1007,12 +1053,26 @@ impl StateInner {
             AvailableSpace::MinContent,
         );
 
+        let started = cx.background_executor().now();
+        let mut out_of_time = false;
+        let mut left_unmeasured = false;
+        let mut measured_any = false;
         let mut measured_items = Vec::default();
 
         for (ix, item) in cursor.enumerate() {
+            if item.size().is_none() && out_of_time {
+                left_unmeasured = true;
+                measured_items.push(item.clone());
+                continue;
+            }
             let size = item.size().unwrap_or_else(|| {
+                measured_any = true;
                 let mut element = render_item(ix, window, cx);
-                element.layout_as_root(available_item_space, window, cx)
+                let size = element.layout_as_root(available_item_space, window, cx);
+                // Checked after an item, so that every frame measures at least one.
+                out_of_time =
+                    budget.is_some_and(|budget| cx.background_executor().now() - started >= budget);
+                size
             });
 
             measured_items.push(ListItem::Measured {
@@ -1022,6 +1082,14 @@ impl StateInner {
         }
 
         self.items = SumTree::from_iter(measured_items, ());
+        if left_unmeasured {
+            self.measuring_behavior.reset();
+        }
+        // After the last slice too, so that a view reading the list's heights
+        // while it renders sees them all.
+        if budget.is_some() && measured_any {
+            window.request_animation_frame();
+        }
     }
 
     fn layout_items(
@@ -1258,11 +1326,8 @@ impl StateInner {
         cx: &mut App,
     ) -> Result<LayoutItemsResponse, ListOffset> {
         window.transact(|window| {
-            match self.measuring_behavior {
-                ListMeasuringBehavior::Measure(has_measured) if !has_measured => {
-                    self.layout_all_items(bounds.size.width, render_item, window, cx);
-                }
-                _ => {}
+            if !self.measuring_behavior.has_measured() {
+                self.layout_all_items(bounds.size.width, render_item, window, cx);
             }
 
             let mut layout_response = self.layout_items(
@@ -1545,9 +1610,13 @@ impl Element for List {
             .last_layout_bounds
             .is_none_or(|last_bounds| last_bounds.size.width != bounds.size.width)
         {
+            let keep_hints = matches!(
+                state.measuring_behavior,
+                ListMeasuringBehavior::MeasureInSlices { .. }
+            );
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint: if keep_hints { item.size_hint() } else { None },
                     focus_handle: item.focus_handle(),
                 }),
                 (),
@@ -2095,6 +2164,50 @@ mod test {
         cx.draw(point(px(0.), px(0.)), size(px(200.), px(200.)), |_, _| {
             view.into_any_element()
         });
+        assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+    }
+
+    #[gpui::test]
+    fn test_measure_all_in_slices(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.))
+            .measure_all_in_slices(std::time::Duration::ZERO);
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        let mut draw = |width: crate::Pixels| {
+            cx.draw(point(px(0.), px(0.)), size(width, px(200.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        };
+
+        // With no time to spare, the first frame measures the four items in
+        // sight and each frame after it one more.
+        draw(px(100.));
+        assert!(state.has_unknown_heights());
+        let mut frames = 1;
+        while state.has_unknown_heights() {
+            draw(px(100.));
+            frames += 1;
+        }
+        assert_eq!(frames, 7);
+        assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+
+        // A new width keeps the old heights as hints while they are
+        // measured again.
+        draw(px(200.));
+        assert!(!state.has_unknown_heights());
         assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
     }
 
